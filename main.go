@@ -21,6 +21,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/static"
 	ctypes "github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/owenrumney/go-sarif/sarif"
 	"github.com/samber/lo"
 	"github.com/spdx/tools-golang/spdx"
 	"github.com/spf13/cobra"
@@ -36,23 +37,25 @@ const (
 	// ref. https://www.iana.org/assignments/media-types/media-types.xhtml
 	mediaKeyCycloneDX = "application/vnd.cyclonedx+json"
 	mediaKeySPDX      = "application/spdx+json"
+	mediaKeySARIF     = "application/sarif+json"
 	// 2023/4/4: Since there is no MediaType specialized for vulnerability information registered with IANA, we use the json type.
 	mediaKeyCosignVuln = "application/json"
 )
 
 var errFailedSBOMDetection = fmt.Errorf("failed to detect SBOM")
+var errFailedSARIFDetection = fmt.Errorf("failed to detect SARIF")
 var errFailedVulnDetection = fmt.Errorf("failed to detect Cosign Vulnerability")
 
 type options struct {
 	Annotations map[string]string
+	Subject     string
 }
 
 type referrer struct {
-	annotations map[string]string
-	mediaType   ctypes.MediaType
-	bytes       []byte
-	targetRepo  name.Digest
-	targetDesc  v1.Descriptor
+	annotations     map[string]string
+	mediaType       ctypes.MediaType
+	bytes           []byte
+	targetReference name.Reference
 }
 
 func (r *referrer) Image() (v1.Image, error) {
@@ -63,22 +66,27 @@ func (r *referrer) Image() (v1.Image, error) {
 		return nil, fmt.Errorf("error appending layer: %w", err)
 	}
 
-	img = mutate.MediaType(img, r.targetDesc.MediaType)
+	targetDesc, err := remote.Head(r.targetReference, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	if err != nil {
+		return nil, fmt.Errorf("error getting descriptor: %w", err)
+	}
+
+	img = mutate.MediaType(img, targetDesc.MediaType)
 	img = mutate.ConfigMediaType(img, r.mediaType)
 	img = mutate.Annotations(img, r.annotations).(v1.Image)
-	img = mutate.Subject(img, r.targetDesc).(v1.Image)
+	img = mutate.Subject(img, *targetDesc).(v1.Image)
 
 	return img, nil
 }
 
-func (r *referrer) Tag(img v1.Image) (name.Digest, error) {
+func (r *referrer) Tag(img v1.Image) (name.Reference, error) {
 	digest, err := img.Digest()
 	if err != nil {
 		return name.Digest{}, fmt.Errorf("error getting image digest: %w", err)
 	}
 
 	tag, err := name.NewDigest(
-		fmt.Sprintf("%s/%s@%s", r.targetRepo.RegistryStr(), r.targetRepo.RepositoryStr(), digest.String()),
+		fmt.Sprintf("%s/%s@%s", r.targetReference.Context().RegistryStr(), r.targetReference.Context().RepositoryStr(), digest.String()),
 	)
 	if err != nil {
 		return name.Digest{}, fmt.Errorf("error creating new digest: %w", err)
@@ -138,14 +146,22 @@ func tryReferrerFromSBOM(r io.Reader, opts options) (referrer, error) {
 
 	var mediaType ctypes.MediaType
 	var anns map[string]string
-	var repo name.Digest
+	var ref name.Reference
 
 	switch format {
 	case sbom.FormatCycloneDXJSON:
-		repo, err = repoFromPurl(decoded.CycloneDX.Metadata.Component.BOMRef)
-		if err != nil {
-			return referrer{}, fmt.Errorf("error getting repository from CycloneDX: %w", err)
+		if opts.Subject != "" {
+			ref, err = name.ParseReference(opts.Subject)
+			if err != nil {
+				return referrer{}, fmt.Errorf("error parsing subject: %w", err)
+			}
+		} else {
+			ref, err = repoFromPurl(decoded.CycloneDX.Metadata.Component.BOMRef)
+			if err != nil {
+				return referrer{}, fmt.Errorf("error getting repository from CycloneDX: %w", err)
+			}
 		}
+
 		anns = map[string]string{
 			annotationKeyDescription: "CycloneDX JSON SBOM",
 			annotationKeyCreated:     time.Now().Format(time.RFC3339),
@@ -153,10 +169,18 @@ func tryReferrerFromSBOM(r io.Reader, opts options) (referrer, error) {
 		mediaType = mediaKeyCycloneDX
 
 	case sbom.FormatSPDXJSON:
-		repo, err = repoFromSpdx(*decoded.SPDX)
-		if err != nil {
-			return referrer{}, fmt.Errorf("error getting repository from SPDX: %w", err)
+		if opts.Subject != "" {
+			ref, err = name.ParseReference(opts.Subject)
+			if err != nil {
+				return referrer{}, fmt.Errorf("error parsing subject: %w", err)
+			}
+		} else {
+			ref, err = repoFromSpdx(*decoded.SPDX)
+			if err != nil {
+				return referrer{}, fmt.Errorf("error getting repository from SPDX: %w", err)
+			}
 		}
+
 		anns = map[string]string{
 			annotationKeyDescription: "SPDX JSON SBOM",
 			annotationKeyCreated:     time.Now().Format(time.RFC3339),
@@ -169,19 +193,58 @@ func tryReferrerFromSBOM(r io.Reader, opts options) (referrer, error) {
 
 	log.Logger.Infof("SBOM detected: %s", format)
 
-	targetDesc, err := remote.Head(repo, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	if err != nil {
-		return referrer{}, fmt.Errorf("error getting descriptor: %w", err)
-	}
-
 	anns = lo.Assign(anns, opts.Annotations)
 
 	return referrer{
-		annotations: anns,
-		mediaType:   mediaType,
-		bytes:       b,
-		targetRepo:  repo,
-		targetDesc:  *targetDesc,
+		annotations:     anns,
+		mediaType:       mediaType,
+		bytes:           b,
+		targetReference: ref,
+	}, nil
+}
+
+func tryReferrerFromSarif(r io.Reader, opts options) (referrer, error) {
+	b, err := io.ReadAll(r)
+	if err != nil {
+		return referrer{}, fmt.Errorf("error reading: %w", err)
+
+	}
+	fromBytes, err := sarif.FromBytes(b)
+	if err != nil {
+		return referrer{}, err
+	}
+
+	// A naive detection would be to check whether the $schema contains ‘sarif.’
+	// Trivy v0.38.3 generate the following schema:
+	//   https://json.schemastore.org/sarif-2.1.0-rtm.5.json
+	if !strings.Contains(fromBytes.Schema, "sarif") {
+		return referrer{}, errFailedSARIFDetection
+	}
+
+	// After Trivy supports for the artifact location, we can detect the subject automatically.
+	//   https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html#_Toc34317499
+	if opts.Subject == "" {
+		return referrer{}, fmt.Errorf("subject is required for SARIF")
+	}
+
+	ref, err := name.ParseReference(opts.Subject)
+	if err != nil {
+		return referrer{}, fmt.Errorf("error parsing subject: %w", err)
+	}
+
+	log.Logger.Infof("SARIF detected")
+
+	anns := map[string]string{
+		annotationKeyDescription: "SARIF",
+		annotationKeyCreated:     time.Now().Format(time.RFC3339),
+	}
+	anns = lo.Assign(anns, opts.Annotations)
+
+	return referrer{
+		annotations:     anns,
+		mediaType:       ctypes.MediaType(mediaKeySARIF),
+		bytes:           b,
+		targetReference: ref,
 	}, nil
 }
 
@@ -201,14 +264,17 @@ func tryReferrerFromVulnerability(r io.Reader, opts options) (referrer, error) {
 		return referrer{}, fmt.Errorf("no RepoDigests found in vulnerability data: %w", errFailedVulnDetection)
 	}
 
-	repo, err := name.NewDigest(d.Scanner.Result.Metadata.RepoDigests[0])
-	if err != nil {
-		return referrer{}, fmt.Errorf("error creating new digest: %w", err)
-	}
-
-	targetDesc, err := remote.Head(repo, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	if err != nil {
-		return referrer{}, fmt.Errorf("error fetching target descriptor: %w", err)
+	var ref name.Reference
+	if opts.Subject != "" {
+		ref, err = name.ParseReference(opts.Subject)
+		if err != nil {
+			return referrer{}, fmt.Errorf("error parsing subject: %w", err)
+		}
+	} else {
+		ref, err = name.NewDigest(d.Scanner.Result.Metadata.RepoDigests[0])
+		if err != nil {
+			return referrer{}, fmt.Errorf("error creating new digest: %w", err)
+		}
 	}
 
 	log.Logger.Infof("Cosign vulnerability data detected")
@@ -220,11 +286,10 @@ func tryReferrerFromVulnerability(r io.Reader, opts options) (referrer, error) {
 	anns = lo.Assign(anns, opts.Annotations)
 
 	return referrer{
-		annotations: anns,
-		mediaType:   ctypes.MediaType(mediaKeyCosignVuln),
-		bytes:       b,
-		targetRepo:  repo,
-		targetDesc:  *targetDesc,
+		annotations:     anns,
+		mediaType:       ctypes.MediaType(mediaKeyCosignVuln),
+		bytes:           b,
+		targetReference: ref,
 	}, nil
 }
 
@@ -243,6 +308,13 @@ func referrerFromReader(r io.Reader, opts options) (referrer, error) {
 	}
 
 	log.Logger.Infof("Failed to detect a valid SBOM: ensure the provided SBOM is generated by Trivy, as only Trivy-generated SBOMs are currently supported")
+
+	ref, err = tryReferrerFromSarif(bytes.NewReader(b), opts)
+	if err == nil {
+		return ref, nil
+	} else if err != nil && err != errFailedSARIFDetection {
+		return referrer{}, fmt.Errorf("error processing SARIF: %w", err)
+	}
 
 	ref, err = tryReferrerFromVulnerability(bytes.NewReader(b), opts)
 	if err == nil {
@@ -331,6 +403,11 @@ func main() {
 				reader = os.Stdin
 			}
 
+			subject, err := cmd.Flags().GetString("subject")
+			if err != nil {
+				return fmt.Errorf("error getting subject: %w", err)
+			}
+
 			annList, err := cmd.Flags().GetStringSlice("annotation")
 			if err != nil {
 				return fmt.Errorf("error getting annotations: %w", err)
@@ -345,7 +422,7 @@ func main() {
 				ann[kv[0]] = kv[1]
 			}
 
-			err = putReferrer(reader, options{Annotations: ann})
+			err = putReferrer(reader, options{Annotations: ann, Subject: subject})
 			if err != nil {
 				return fmt.Errorf("error putting referrer: %w", err)
 			}
@@ -355,6 +432,7 @@ func main() {
 	}
 	putCmd.Flags().StringP("file", "f", "", "file path. If a file path is not specified, it will accept input from the standard input.")
 	putCmd.Flags().StringSliceP("annotation", "", nil, "annotations associated with the artifact (can specify multiple or separate values with commas: key1=path1,key2=path2)")
+	putCmd.Flags().StringP("subject", "", "", "set the subject to a reference (If the value is not set, it will attempt to detect it automatically from the input)")
 
 	rootCmd.AddCommand(putCmd)
 
