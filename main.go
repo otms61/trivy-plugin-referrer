@@ -162,7 +162,7 @@ func main() {
 		},
 	}
 	getCmd.Flags().StringP("type", "", "", "artifact type (cyclonedx, spdx-json, sarif, cosign-vuln)")
-	getCmd.Flags().StringP("digest", "", "", "referrer digest")
+	getCmd.Flags().StringP("digest", "", "", "referrer digest. If the length of the digest is only partial, search for artifacts with matching prefixes")
 	getCmd.Flags().StringP("output", "o", "", "output file name")
 
 	rootCmd.AddCommand(getCmd)
@@ -221,7 +221,7 @@ func main() {
 		},
 	}
 	listCmd.Flags().StringSliceP("filter-annotation", "", nil, "filter annotations associated with the artifact (can specify multiple or separate values with commas: key1=path1,key2=path2)")
-	listCmd.Flags().StringP("format", "", "", "format (json)")
+	listCmd.Flags().StringP("format", "", "", "format (json, oneline)")
 	listCmd.Flags().StringP("type", "", "", "artifact type (cyclonedx, spdx-json, sarif, cosign-vuln)")
 	listCmd.Flags().StringP("output", "o", "", "output file name")
 
