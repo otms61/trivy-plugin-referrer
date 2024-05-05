@@ -29,3 +29,7 @@ jobs:
           args: release -f=goreleaser.yml --rm-dist --timeout 60m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: '${{ github.workspace }}/dist/**/referrer'
