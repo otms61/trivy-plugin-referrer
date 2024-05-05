@@ -44,3 +44,9 @@ jobs:
         with:
           subject-path: '${{ github.workspace }}/dist/**/referrer'
           sbom-path: sbom.cdx.json
+      - name: Attest custom predicate
+        uses: actions/attest@v1
+        with:
+          subject-path: '${{ github.workspace }}/dist/**/referrer'
+          predicate-type: 'https://example.com/my-predicate/v1'
+          predicate: '{"hello": "world"}'
