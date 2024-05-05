@@ -28,11 +28,6 @@ jobs:
         with:
           args: mod -licenses -json -output sbom.cdx.json
           version: v1
-      - name: Attest Sbom
-        uses: actions/attest-sbom@v1
-        with:
-          subject-path: '${{ github.workspace }}/dist/**/referrer'
-          sbom-path: sbom.cdx.json
       - name: GoReleaser
         uses: goreleaser/goreleaser-action@v4
         with:
@@ -44,3 +39,8 @@ jobs:
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: '${{ github.workspace }}/dist/**/referrer'
+      - name: Attest Sbom
+        uses: actions/attest-sbom@v1
+        with:
+          subject-path: '${{ github.workspace }}/dist/**/referrer'
+          sbom-path: sbom.cdx.json
